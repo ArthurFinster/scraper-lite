@@ -31,6 +31,8 @@ type collectorConf struct {
 	minCollected  int
 	safeCounter   *lib.SiteCounter
 	scrapeTimeout time.Duration
+	httpTimeout   time.Duration
+	collyTimeout  time.Duration
 	searchDepth   int
 }
 
@@ -56,6 +58,8 @@ func main() {
 		searchDepth          int
 		maxDelay             time.Duration
 		scrapeTimeout        time.Duration
+		httpTimeout          time.Duration
+		collyTimeout         time.Duration
 		maxRetries           float64
 		urlList              string
 		filePath             string
@@ -65,6 +69,8 @@ func main() {
 	flag.IntVar(&minCollected, "min_collected", 1, "minimum pdfs accepted, any amount below this number will be sent to the headless scraper")
 	flag.IntVar(&searchDepth, "depth", 0, "how many layers of links to search through, if 0 will search entire site")
 	flag.Float64Var(&maxRetries, "max_retries", 3, "maximum request retries")
+	flag.DurationVar(&httpTimeout, "http_timeout", 3*time.Second, "timeout for requests made by the http client")
+	flag.DurationVar(&collyTimeout, "colly_timeout", 2*time.Second, "timeout for requests made by the colly client")
 	flag.DurationVar(&maxDelay, "max_delay", 2*time.Second, "maximum value for random request delay in millisecods")
 	flag.DurationVar(&scrapeTimeout, "site_scrape_timeout", 25*time.Minute, "amount of time in minutes to scrape a site for before writing to file")
 	flag.StringVar(&urlList, "url_list", "", "a semicolon delimited list of site urls, if empty, will try to find list file")
@@ -80,7 +86,7 @@ func main() {
 		// explicitly allow debug level logs in local
 		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	} else {
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
 
 	// we have to at least have one go routine running scraping sites
@@ -160,12 +166,11 @@ func NewFinsterCollector(startUrl string, conf collectorConf) (*finsterCollector
 			// allow any pdf to be scraped even if not on company domain
 			regexp.MustCompile(".*.pdf"),
 		),
+		colly.MaxDepth(conf.searchDepth),
 	)
 
-	retryClient := lib.NewRetryClient(conf.log)
-
 	// timout at 2 seconds, the most common thing to slow this scraper down is a slow website
-	c.SetRequestTimeout(2 * time.Second)
+	c.SetRequestTimeout(conf.collyTimeout)
 	parsedUrl, err := url.Parse(startUrl)
 	if err != nil {
 		return nil, fmt.Errorf("invalid starturl %w", err)
@@ -204,22 +209,17 @@ func NewFinsterCollector(startUrl string, conf collectorConf) (*finsterCollector
 		&queue.InMemoryQueueStorage{MaxSize: 10000},
 	)
 
-	c.MaxDepth = conf.searchDepth
-
 	// use random user agent on each website, will change on each scrape
 	extensions.RandomUserAgent(c)
 
 	fc := &finsterCollector{
-		// collector
-		baseUrl:       baseUrl,
-		startUrl:      parsedUrl,
-		log:           conf.log.With(slog.String("startUrl", startUrl), slog.String("baseUrl", baseUrl)),
-		scrapeTimeout: conf.scrapeTimeout,
-		minCollected:  conf.minCollected,
-		siteMap:       lib.NewSiteMap(),
-		retryClient:   retryClient,
-
-		// scraper
+		baseUrl:           baseUrl,
+		startUrl:          parsedUrl,
+		log:               conf.log.With(slog.String("startUrl", startUrl), slog.String("baseUrl", baseUrl)),
+		scrapeTimeout:     conf.scrapeTimeout,
+		minCollected:      conf.minCollected,
+		siteMap:           lib.NewSiteMap(),
+		retryClient:       lib.NewRetryClient(conf.log, conf.httpTimeout),
 		backoffMultiplier: 2,
 		c:                 c,
 		safeCounter:       conf.safeCounter,
@@ -255,8 +255,6 @@ func (fc *finsterCollector) handleCallbacks() {
 		// if we have not previously visited the link
 		if !fc.siteMap.WasVisited(newUrl.String()) {
 			rel := e.Attr("rel")
-
-			fmt.Println(newUrl)
 			// skip stylesheets, loads of pages to be avoided with this
 			if !lib.IsValidRelTag(rel) {
 				return
@@ -391,7 +389,6 @@ func (fc *finsterCollector) handleCallbacks() {
 				fc.log.Debug("Retrying request", slog.String("retry", r.Request.URL.String()), slog.Duration("delay", delay), slog.Float64("retriesLeft", retriesLeft), slog.Any("error", err))
 				time.Sleep(delay)
 				if firstRun && retriesLeft == 1 {
-					fc.log.Info("")
 					time.Sleep(time.Minute * 2)
 				}
 				r.Ctx.Put("retriesLeft", retriesLeft-1)

@@ -3,7 +3,6 @@ package lib
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,19 +16,22 @@ type RetryHttpClient struct {
 	backoffMultiplier int
 	c                 *retryablehttp.Client
 	sem               *semaphore.Weighted
+	log               *slog.Logger
 }
 
-func NewRetryClient(log *slog.Logger) *RetryHttpClient {
+func NewRetryClient(log *slog.Logger, timeout time.Duration) *RetryHttpClient {
 	hc := &RetryHttpClient{
 		backoffMultiplier: 0,
+		log:               log.With(slog.String("client", "http")),
 	}
 
 	retryClient := retryablehttp.NewClient()
-	retryClient.HTTPClient.Timeout = time.Second * 2
+	// set fairly long timeout, this should be tweaked based on results, any failed requests from here are not added to the queue
+	retryClient.HTTPClient.Timeout = 3 * time.Second
 	retryClient.RetryWaitMin = 50 * time.Millisecond
 	retryClient.RetryWaitMax = 5 * time.Second
 	retryClient.RetryMax = 3 // Number of retries
-	retryClient.Logger = log
+	retryClient.Logger = nil
 	retryClient.RequestLogHook = func(l retryablehttp.Logger, req *http.Request, attemptNumber int) {
 		// attemptNumber is 0 for the initial request, 1 for the first retry, etc.
 		if attemptNumber > 0 {
@@ -37,12 +39,12 @@ func NewRetryClient(log *slog.Logger) *RetryHttpClient {
 				// this conrols the delay for http retries
 				hc.backoffMultiplier++
 			}
-			l.Printf("Retry attempt #%d for %s", attemptNumber, req.URL)
+			hc.log.Debug("Retring request", slog.Int("attemptNumber", attemptNumber), slog.String("newUrl", req.URL.String()))
 		} else {
 			if hc.backoffMultiplier > 0 {
 				hc.backoffMultiplier--
 			}
-			l.Printf("First attempt to %s", req.URL)
+			hc.log.Debug("First attempt to %s", slog.String("newUrl", req.URL.String()))
 		}
 	}
 
@@ -50,14 +52,14 @@ func NewRetryClient(log *slog.Logger) *RetryHttpClient {
 	hc.sem = semaphore.NewWeighted(1)
 
 	// Add a hook to log the response after each attempt
-	retryClient.ResponseLogHook = func(logger retryablehttp.Logger, resp *http.Response) {
-		if resp != nil {
-			logger.Printf("ResponseLogHook: received status %d from %s",
-				resp.StatusCode, resp.Request.URL.String())
-		} else {
-			logger.Printf("ResponseLogHook: received nil response")
-		}
-	}
+	// retryClient.ResponseLogHook = func(logger retryablehttp.Logger, resp *http.Response) {
+	// 	if resp != nil {
+	// 		logger.Printf("ResponseLogHook: received status %d from %s",
+	// 			resp.StatusCode, resp.Request.URL.String())
+	// 	} else {
+	// 		logger.Printf("ResponseLogHook: received nil response")
+	// 	}
+	// }
 
 	return hc
 }
@@ -113,7 +115,6 @@ func (r *RetryHttpClient) IsPdf(currentUrl, newUrl string) (bool, http.Header, e
 
 	// before reading the body, check if its a pdf from the headers
 	if resp.Header.Get("Content-Type") == "application/pdf" {
-		fmt.Println("found from headers")
 		return true, resp.Header, nil
 	}
 
@@ -128,7 +129,6 @@ func (r *RetryHttpClient) IsPdf(currentUrl, newUrl string) (bool, http.Header, e
 
 	// check if it begins with "%PDF", if so return true
 	if bytes.HasPrefix(buf, []byte("%PDF")) {
-		fmt.Println("found from magic bytes")
 		return true, resp.Header, nil
 	}
 

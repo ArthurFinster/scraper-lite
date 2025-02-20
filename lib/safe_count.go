@@ -2,13 +2,14 @@ package lib
 
 import "sync"
 
-// A concurrently accessible counter
+// A concurrently accessible and editable counter
 type SiteCounter struct {
 	mu      sync.Mutex
 	count   int
 	blocked int
 }
 
+// create a new concurrently accessible and editable counter
 func NewSiteCounter() *SiteCounter {
 	return &SiteCounter{
 		mu:      sync.Mutex{},
@@ -30,14 +31,14 @@ func (s *SiteCounter) Increment() {
 	s.mu.Unlock()
 }
 
-func (s *SiteCounter) TotalCount() int {
+func (s *SiteCounter) GetTotalViewed() int {
 	s.mu.Lock()
 	tc := s.count
 	s.mu.Unlock()
 	return tc
 }
 
-func (s *SiteCounter) TotalBlocked() int {
+func (s *SiteCounter) GetTotalBlocked() int {
 	s.mu.Lock()
 	b := s.blocked
 	s.mu.Unlock()

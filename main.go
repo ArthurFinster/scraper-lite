@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,10 +21,7 @@ import (
 	"github.com/gocolly/colly/v2"
 	"github.com/gocolly/colly/v2/extensions"
 	"github.com/gocolly/colly/v2/queue"
-	"github.com/hashicorp/go-retryablehttp"
-	"golang.org/x/net/http2"
 	"golang.org/x/net/publicsuffix"
-	"golang.org/x/sync/semaphore"
 )
 
 type collectorConf struct {
@@ -43,7 +38,7 @@ type finsterCollector struct {
 	backoffMultiplier int
 	baseUrl           string
 	c                 *colly.Collector
-	httpClient        *finsterHttpClient
+	retryClient       *lib.RetryHttpClient
 	log               *slog.Logger
 	maxRetries        float64
 	minCollected      int
@@ -52,137 +47,6 @@ type finsterCollector struct {
 	scrapeTimeout     time.Duration
 	startUrl          *url.URL
 	siteMap           *lib.SiteMap
-}
-
-type finsterHttpClient struct {
-	backoffMultiplier int
-	c                 *retryablehttp.Client
-	sem               *semaphore.Weighted
-}
-
-func NewFinsterCollector(startUrl string, conf collectorConf) (*finsterCollector, error) {
-	c := colly.NewCollector(
-		// colly.Async(conf.async),
-		colly.URLFilters(
-			// allow any pdf to be scraped even if not on company domain
-			regexp.MustCompile(".*.pdf"),
-		),
-	)
-
-	hc := &finsterHttpClient{
-		backoffMultiplier: 0,
-	}
-
-	retryClient := retryablehttp.NewClient()
-	retryClient.RetryWaitMin = 50 * time.Millisecond
-	retryClient.RetryWaitMax = 5 * time.Second
-	retryClient.RetryMax = 3 // Number of retries
-	retryClient.Logger = conf.log
-	retryClient.RequestLogHook = func(l retryablehttp.Logger, req *http.Request, attemptNumber int) {
-		// attemptNumber is 0 for the initial request, 1 for the first retry, etc.
-		if attemptNumber > 0 {
-			if attemptNumber == retryClient.RetryMax {
-				// this conrols the delay for http retries
-				hc.backoffMultiplier++
-			}
-			l.Printf("Retry attempt #%d for %s", attemptNumber, req.URL)
-		} else {
-			if hc.backoffMultiplier > 0 {
-				hc.backoffMultiplier--
-			}
-			l.Printf("First attempt to %s", req.URL)
-		}
-	}
-
-	hc.c = retryClient
-	hc.sem = semaphore.NewWeighted(1)
-
-	// Add a hook to log the response after each attempt
-	retryClient.ResponseLogHook = func(logger retryablehttp.Logger, resp *http.Response) {
-		if resp != nil {
-			logger.Printf("ResponseLogHook: received status %d from %s",
-				resp.StatusCode, resp.Request.URL.String())
-		} else {
-			logger.Printf("ResponseLogHook: received nil response")
-		}
-	}
-
-	// Create a custom HTTP transport
-	transport := &http.Transport{
-		// You can add additional settings here if needed.
-		// TLSClientConfig: &tls.Config{...},
-	}
-	// Explicitly enable HTTP/2 on the custom transport.
-	if err := http2.ConfigureTransport(transport); err != nil {
-		log.Fatalf("Error configuring HTTP/2: %v", err)
-	}
-
-	// timout at 2 seconds, the most common thing to slow this scraper down is a slow website
-	c.SetRequestTimeout(5 * time.Second)
-	parsedUrl, err := url.Parse(startUrl)
-	if err != nil {
-		return nil, fmt.Errorf("invalid starturl %w", err)
-	}
-
-	host, err := publicsuffix.EffectiveTLDPlusOne(parsedUrl.Hostname())
-	if err != nil {
-		log.Fatal(err)
-	}
-	var re *regexp.Regexp
-	// Split by "." and get the first part (e.g., "novonordisk")
-	parts := strings.Split(host, ".")
-	var baseUrl string
-	if len(parts) > 0 {
-		baseUrl = parts[0]
-		// allow (anything .) || (//) company base url (.anything)
-		re, err = regexp.Compile(fmt.Sprintf(`.*(\.|\/\/)%s.*`, parts[0]))
-		if err != nil {
-			return nil, fmt.Errorf("error setting up regex for url before scrape: %w", err)
-		}
-	} else {
-		return nil, errors.New("could not extract name from host")
-	}
-
-	c.URLFilters = append(c.URLFilters, re)
-
-	// this essentially adds a delay after a request
-	c.Limit(&colly.LimitRule{
-		// DomainGlob:  "*",
-		RandomDelay: conf.maxDelay,
-	})
-
-	// create a request queue with 2 consumer threads
-	q, _ := queue.New(
-		1, // Number of consumer threads
-		&queue.InMemoryQueueStorage{MaxSize: 10000},
-	)
-
-	c.MaxDepth = conf.searchDepth
-
-	// use random user agent on each website, will change on each scrape
-	extensions.RandomUserAgent(c)
-
-	fc := &finsterCollector{
-		// collector
-		baseUrl:       baseUrl,
-		startUrl:      parsedUrl,
-		log:           conf.log.With(slog.String("startUrl", startUrl), slog.String("baseUrl", baseUrl)),
-		scrapeTimeout: conf.scrapeTimeout,
-		minCollected:  conf.minCollected,
-		siteMap:       lib.NewSiteMap(),
-		httpClient:    hc,
-
-		// scraper
-		backoffMultiplier: 2,
-		c:                 c,
-		safeCounter:       conf.safeCounter,
-		maxRetries:        conf.maxRetries,
-		q:                 q,
-	}
-
-	fc.handleCallbacks()
-	// Add to the WaitGroup before starting a goroutine
-	return fc, nil
 }
 
 func main() {
@@ -225,6 +89,7 @@ func main() {
 		return
 	}
 
+	// either use list provided, or file provided by user
 	var urlStr string
 	if urlList != "" {
 		urlStr = urlList
@@ -288,6 +153,85 @@ func main() {
 	logger.Info("scrape finished", slog.Duration("total_time", time.Since(startTime)), slog.Int("scaped_html", safeCounter.GetTotalViewed()-safeCounter.GetTotalBlocked()), slog.Int("scaped_headless", safeCounter.GetTotalBlocked()))
 }
 
+func NewFinsterCollector(startUrl string, conf collectorConf) (*finsterCollector, error) {
+	c := colly.NewCollector(
+		// colly.Async(conf.async),
+		colly.URLFilters(
+			// allow any pdf to be scraped even if not on company domain
+			regexp.MustCompile(".*.pdf"),
+		),
+	)
+
+	retryClient := lib.NewRetryClient(conf.log)
+
+	// timout at 2 seconds, the most common thing to slow this scraper down is a slow website
+	c.SetRequestTimeout(2 * time.Second)
+	parsedUrl, err := url.Parse(startUrl)
+	if err != nil {
+		return nil, fmt.Errorf("invalid starturl %w", err)
+	}
+
+	host, err := publicsuffix.EffectiveTLDPlusOne(parsedUrl.Hostname())
+	if err != nil {
+		log.Fatal(err)
+	}
+	var re *regexp.Regexp
+	// Split by "." and get the first part (e.g., "novonordisk")
+	parts := strings.Split(host, ".")
+	var baseUrl string
+	if len(parts) > 0 {
+		baseUrl = parts[0]
+		// allow (anything .) || (//) company base url (.anything)
+		re, err = regexp.Compile(fmt.Sprintf(`.*(\.|\/\/)%s.*`, parts[0]))
+		if err != nil {
+			return nil, fmt.Errorf("error setting up regex for url before scrape: %w", err)
+		}
+	} else {
+		return nil, errors.New("could not extract name from host")
+	}
+
+	c.URLFilters = append(c.URLFilters, re)
+
+	// this essentially adds a delay after a request
+	c.Limit(&colly.LimitRule{
+		// DomainGlob:  "*",
+		RandomDelay: conf.maxDelay,
+	})
+
+	// create a request queue with 2 consumer threads
+	q, _ := queue.New(
+		1, // Number of consumer threads
+		&queue.InMemoryQueueStorage{MaxSize: 10000},
+	)
+
+	c.MaxDepth = conf.searchDepth
+
+	// use random user agent on each website, will change on each scrape
+	extensions.RandomUserAgent(c)
+
+	fc := &finsterCollector{
+		// collector
+		baseUrl:       baseUrl,
+		startUrl:      parsedUrl,
+		log:           conf.log.With(slog.String("startUrl", startUrl), slog.String("baseUrl", baseUrl)),
+		scrapeTimeout: conf.scrapeTimeout,
+		minCollected:  conf.minCollected,
+		siteMap:       lib.NewSiteMap(),
+		retryClient:   retryClient,
+
+		// scraper
+		backoffMultiplier: 2,
+		c:                 c,
+		safeCounter:       conf.safeCounter,
+		maxRetries:        conf.maxRetries,
+		q:                 q,
+	}
+
+	fc.handleCallbacks()
+	// Add to the WaitGroup before starting a goroutine
+	return fc, nil
+}
+
 func (fc *finsterCollector) handleCallbacks() {
 	// on every html element that has an href
 	fc.c.OnHTML("*[href]", func(e *colly.HTMLElement) {
@@ -312,6 +256,7 @@ func (fc *finsterCollector) handleCallbacks() {
 		if !fc.siteMap.WasVisited(newUrl.String()) {
 			rel := e.Attr("rel")
 
+			fmt.Println(newUrl)
 			// skip stylesheets, loads of pages to be avoided with this
 			if !lib.IsValidRelTag(rel) {
 				return
@@ -341,7 +286,7 @@ func (fc *finsterCollector) handleCallbacks() {
 
 			// here we perform a quick request using a normal retryable http client, this is quicker, and lighter than letting colly do a request and waiting for a full response
 			// + html parse of the link. This link might not on the same base path, which is common for pdf's stored in some other location (cdn's etc)
-			pdf, err := fc.isPdf(currentUrl.String(), newUrl.String())
+			pdf, headers, err := fc.retryClient.IsPdf(currentUrl.String(), newUrl.String())
 			if err != nil {
 				fc.log.Error("error checking if link is a pdf", slog.String("newUrl", newUrl.String()), slog.Any("error", err))
 				// isPdf can have an eof error but have still found out it's a pdf so we only want to say we've visited this link if the
@@ -352,6 +297,14 @@ func (fc *finsterCollector) handleCallbacks() {
 				}
 			}
 			if pdf {
+				fc.log.Debug("read ahead pdf found", slog.String("pdfUrl", newUrl.String()))
+				fc.siteMap.AppendPdf(lib.Url{
+					ParentUrl:      currentUrl.String(),
+					PdfUrl:         newUrl.String(),
+					LastModified:   headers.Get("Last-Modified"),
+					Etag:           headers.Get("ETag"),
+					ExtractionTime: time.Now(),
+				})
 				return
 			}
 
@@ -482,9 +435,9 @@ func (fc *finsterCollector) run(wg *sync.WaitGroup, semaphore chan struct{}) {
 	// wait for either queue to be empty, or timeout
 	select {
 	case <-done:
-		fmt.Println("All goroutines finished before timeout")
+		fc.log.Debug("All goroutines finished before timeout, exiting")
 	case <-time.After(fc.scrapeTimeout):
-		fmt.Println("Timeout reached, exiting")
+		fc.log.Debug("Timeout reached, exiting")
 	}
 
 	pdfsFound := fc.siteMap.GetLinks()
@@ -520,92 +473,4 @@ func (fc *finsterCollector) addRequest(currentUrl, newLink *url.URL) error {
 		Ctx:     ctx,
 		Headers: h,
 	})
-}
-
-// isPdf looks ahead at a link, doing a request, and first checking the headers, then the first 4 bytes,
-// to see if it is a pdf. If it is, it adds it to the list of found pdf's
-func (fc *finsterCollector) isPdf(currentUrl, newUrl string) (bool, error) {
-	// this handles looking ahead at links that are not on the same basepath, we can do this a lot quicker than the base path
-	if err := fc.httpClient.sem.Acquire(context.Background(), 1); err != nil {
-		return false, err
-	}
-
-	// Ensure the semaphore is released when we're done
-	defer fc.httpClient.sem.Release(1)
-
-	// Introduce a random delay before making the request, this backoffMultiplier is incremented or decremented based on failed/ passed requests
-	delay := time.Duration(fc.httpClient.backoffMultiplier) * time.Second
-	time.Sleep(delay)
-
-	// Create a GET request with a Range header asking for the first 4 bytes
-	req, err := retryablehttp.NewRequest("GET", newUrl, nil)
-	if err != nil {
-		return false, err
-	}
-
-	// attempt to give the server a range of bytes to respond with
-	req.Header.Set("Range", "bytes=0-3")
-
-	// add headers to attempt to bypass bot protection
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Referer", "https://www.google.com/")
-	req.Header.Set("DNT", "1")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Cache-Control", "max-age=0")
-	req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="121", "Chromium";v="121", "Not A(Brand";v="99"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
-
-	resp, err := fc.httpClient.c.Do(req)
-	if err != nil {
-		return false, err
-	}
-
-	// close the body the moment we are done reading to free memory
-	defer func() {
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}()
-
-	// before reading the body, check if its a pdf from the headers
-	pdf := false
-	if resp.Header.Get("Content-Type") == "application/pdf" {
-		fmt.Println("found from headers")
-		pdf = true
-	}
-
-	// fairly often, headers are not correct, but the file is still a pdf, here, if the
-	// headers don't return application/pdf we check the first 4 bytes to see if it's a pdf
-	if !pdf {
-
-		buf := make([]byte, 4)
-		n, err := io.ReadFull(resp.Body, buf)
-		if err != nil && err != io.ErrUnexpectedEOF {
-			return false, err
-		}
-		buf = buf[:n]
-
-		// check if it begins with "%PDF"
-		if bytes.HasPrefix(buf, []byte("%PDF")) {
-			fmt.Println("found from magic bytes")
-			pdf = true
-		}
-	}
-
-	if pdf {
-		fc.log.Debug("read ahead pdf found", slog.String("pdfUrl", newUrl))
-		fc.siteMap.AppendPdf(lib.Url{
-			ParentUrl:      currentUrl,
-			PdfUrl:         newUrl,
-			LastModified:   resp.Header.Get("Last-Modified"),
-			Etag:           resp.Header.Get("ETag"),
-			ExtractionTime: time.Now(),
-		})
-	}
-
-	return pdf, nil
 }

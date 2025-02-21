@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"math"
 	"net/http"
@@ -21,7 +20,6 @@ import (
 	"github.com/gocolly/colly/v2"
 	"github.com/gocolly/colly/v2/extensions"
 	"github.com/gocolly/colly/v2/queue"
-	"golang.org/x/net/publicsuffix"
 )
 
 type collectorConf struct {
@@ -36,19 +34,25 @@ type collectorConf struct {
 	searchDepth   int
 }
 
-type finsterCollector struct {
-	backoffMultiplier int
-	baseUrl           string
-	c                 *colly.Collector
-	retryClient       *lib.RetryHttpClient
-	log               *slog.Logger
+// queueCollector does handles the queue, the retries, the requests, etc. Anything to do with calling and dealing with html
+type queueCollector struct {
+	*colly.Collector
+	*queue.Queue
 	maxRetries        float64
-	minCollected      int
-	q                 *queue.Queue
-	safeCounter       *lib.SiteCounter
-	scrapeTimeout     time.Duration
+	backoffMultiplier int
 	startUrl          *url.URL
-	siteMap           *lib.SiteMap
+}
+
+// siteScaper controlls the overall
+type siteScraper struct {
+	baseUrl       string
+	collector     *queueCollector
+	retryClient   *lib.RetryHttpClient
+	log           *slog.Logger
+	minCollected  int
+	safeCounter   *lib.SiteCounter
+	scrapeTimeout time.Duration
+	siteMap       *lib.SiteMap
 }
 
 func main() {
@@ -84,7 +88,8 @@ func main() {
 
 	if env == "local" {
 		// explicitly allow debug level logs in local
-		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		// logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	} else {
 		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
@@ -139,9 +144,12 @@ func main() {
 		minCollected:  minCollected,
 		safeCounter:   safeCounter,
 		scrapeTimeout: scrapeTimeout,
+		httpTimeout:   httpTimeout,
+		collyTimeout:  collyTimeout,
 		searchDepth:   searchDepth,
 	}
 
+	// create a collector for each url
 	for _, url := range urls {
 		fc, err := NewFinsterCollector(url, conf)
 		if err != nil {
@@ -159,72 +167,71 @@ func main() {
 	logger.Info("scrape finished", slog.Duration("total_time", time.Since(startTime)), slog.Int("scaped_html", safeCounter.GetTotalViewed()-safeCounter.GetTotalBlocked()), slog.Int("scaped_headless", safeCounter.GetTotalBlocked()))
 }
 
-func NewFinsterCollector(startUrl string, conf collectorConf) (*finsterCollector, error) {
-	c := colly.NewCollector(
+func NewFinsterCollector(startUrl string, conf collectorConf) (*siteScraper, error) {
+	parsedUrl, err := url.Parse(startUrl)
+	if err != nil {
+		return nil, fmt.Errorf("invalid starting url %w", err)
+	}
+
+	baseUrl, err := lib.GetBaseUrl(parsedUrl)
+	if err != nil {
+		return nil, fmt.Errorf("error getting base url")
+	}
+
+	pdfRegex, err := regexp.Compile(".*.pdf")
+	if err != nil {
+		return nil, fmt.Errorf("error compiling pdf regex: %w", err)
+	}
+
+	urlRegex, err := regexp.Compile(fmt.Sprintf(`.*(\.|\/\/)%s.*`, baseUrl))
+	if err != nil {
+		return nil, fmt.Errorf("error compiling base url regex: %w", err)
+	}
+
+	// set up the colly collector
+	collyCollector := colly.NewCollector(
 		// colly.Async(conf.async),
 		colly.URLFilters(
 			// allow any pdf to be scraped even if not on company domain
-			regexp.MustCompile(".*.pdf"),
+			pdfRegex,
+			urlRegex,
 		),
 		colly.MaxDepth(conf.searchDepth),
 	)
-
 	// timout at 2 seconds, the most common thing to slow this scraper down is a slow website
-	c.SetRequestTimeout(conf.collyTimeout)
-	parsedUrl, err := url.Parse(startUrl)
-	if err != nil {
-		return nil, fmt.Errorf("invalid starturl %w", err)
-	}
-
-	host, err := publicsuffix.EffectiveTLDPlusOne(parsedUrl.Hostname())
-	if err != nil {
-		log.Fatal(err)
-	}
-	var re *regexp.Regexp
-	// Split by "." and get the first part (e.g., "novonordisk")
-	parts := strings.Split(host, ".")
-	var baseUrl string
-	if len(parts) > 0 {
-		baseUrl = parts[0]
-		// allow (anything .) || (//) company base url (.anything)
-		re, err = regexp.Compile(fmt.Sprintf(`.*(\.|\/\/)%s.*`, parts[0]))
-		if err != nil {
-			return nil, fmt.Errorf("error setting up regex for url before scrape: %w", err)
-		}
-	} else {
-		return nil, errors.New("could not extract name from host")
-	}
-
-	c.URLFilters = append(c.URLFilters, re)
-
+	collyCollector.SetRequestTimeout(conf.collyTimeout)
 	// this essentially adds a delay after a request
-	c.Limit(&colly.LimitRule{
+	collyCollector.Limit(&colly.LimitRule{
 		// DomainGlob:  "*",
 		RandomDelay: conf.maxDelay,
 	})
 
-	// create a request queue with 2 consumer threads
+	// create a colly queue
 	q, _ := queue.New(
-		1, // Number of consumer threads
+		1, // set of consumer threads to 1 as we want to control speed at which requests are made
 		&queue.InMemoryQueueStorage{MaxSize: 10000},
 	)
 
 	// use random user agent on each website, will change on each scrape
-	extensions.RandomUserAgent(c)
+	extensions.RandomUserAgent(collyCollector)
 
-	fc := &finsterCollector{
-		baseUrl:           baseUrl,
-		startUrl:          parsedUrl,
-		log:               conf.log.With(slog.String("startUrl", startUrl), slog.String("baseUrl", baseUrl)),
-		scrapeTimeout:     conf.scrapeTimeout,
-		minCollected:      conf.minCollected,
-		siteMap:           lib.NewSiteMap(),
-		retryClient:       lib.NewRetryClient(conf.log, conf.httpTimeout),
-		backoffMultiplier: 2,
-		c:                 c,
-		safeCounter:       conf.safeCounter,
+	collector := &queueCollector{
+		Collector:         collyCollector,
+		Queue:             q,
 		maxRetries:        conf.maxRetries,
-		q:                 q,
+		backoffMultiplier: 2,
+		startUrl:          parsedUrl,
+	}
+
+	fc := &siteScraper{
+		baseUrl:       baseUrl,
+		log:           conf.log.With(slog.String("startUrl", startUrl), slog.String("baseUrl", baseUrl)),
+		scrapeTimeout: conf.scrapeTimeout,
+		minCollected:  conf.minCollected,
+		retryClient:   lib.NewRetryClient(conf.log, conf.httpTimeout),
+		safeCounter:   conf.safeCounter,
+		collector:     collector,
+		siteMap:       lib.NewSiteMap(),
 	}
 
 	fc.handleCallbacks()
@@ -232,19 +239,40 @@ func NewFinsterCollector(startUrl string, conf collectorConf) (*finsterCollector
 	return fc, nil
 }
 
-func (fc *finsterCollector) handleCallbacks() {
-	// on every html element that has an href
-	fc.c.OnHTML("*[href]", func(e *colly.HTMLElement) {
+// handleCallbacks sets up the callbacks that colly uses on different responses/ errors/ elements
+func (fc *siteScraper) handleCallbacks() {
+
+	// when colly sends off a request from the queue, it waits for the response,
+	// on the response we check if the file returned is a pdf
+	fc.collector.OnResponse(func(r *colly.Response) {
+		fc.collector.handleRetry(r, nil)
+
+		if r.Headers.Get("Content-Type") == "application/pdf" {
+			// fc.log.Info("pdf found", slog.String("parentUrl", r.Ctx.Get("parent")), slog.String("pdfUrl", r.Request.URL.String()))
+			fc.siteMap.AppendPdf(lib.Url{
+				ParentUrl:      r.Ctx.Get("parent"),
+				PdfUrl:         r.Request.URL.String(),
+				LastModified:   r.Headers.Get("Last-Modified"),
+				Etag:           r.Headers.Get("ETag"),
+				ExtractionTime: time.Now(),
+			})
+		}
+	})
+
+	// after we check the response, and if the file returned is not a pdf, this callback is triggered
+	// this callback is called for each element on the returned html which has an href attribute
+	fc.collector.OnHTML("*[href]", func(e *colly.HTMLElement) {
 		// get the link from the element
 		link := e.Attr("href")
 
-		// parse the current link and the new link we found in the current link's html
+		// parse the url for the the current page we have
 		currentUrl, err := url.Parse(e.Request.URL.String())
 		if err != nil {
 			fc.log.Error("error parsing current url", slog.Any("error", err))
 			return
 		}
 
+		// parse the url for the new link found on the current page
 		newUrl, err := url.Parse(e.Request.AbsoluteURL(link))
 		if err != nil {
 			// using a warn here as this is fairly likely since we have not cleaned the link at this point
@@ -256,7 +284,7 @@ func (fc *finsterCollector) handleCallbacks() {
 		if !fc.siteMap.WasVisited(newUrl.String()) {
 			rel := e.Attr("rel")
 			// skip stylesheets, loads of pages to be avoided with this
-			if !lib.IsValidRelTag(rel) {
+			if !lib.IsValidRelAttr(rel) {
 				return
 			}
 
@@ -286,10 +314,10 @@ func (fc *finsterCollector) handleCallbacks() {
 			// + html parse of the link. This link might not on the same base path, which is common for pdf's stored in some other location (cdn's etc)
 			pdf, headers, err := fc.retryClient.IsPdf(currentUrl.String(), newUrl.String())
 			if err != nil {
-				fc.log.Error("error checking if link is a pdf", slog.String("newUrl", newUrl.String()), slog.Any("error", err))
 				// isPdf can have an eof error but have still found out it's a pdf so we only want to say we've visited this link if the
 				// error is not EOF and it's not a pdf
 				if !errors.Is(err, io.EOF) && !pdf {
+					fc.log.Debug("error checking if link is a pdf", slog.String("newUrl", newUrl.String()), slog.Any("error", err))
 					fc.siteMap.Visited(newUrl.String())
 					return
 				}
@@ -309,14 +337,15 @@ func (fc *finsterCollector) handleCallbacks() {
 			// once we have checked the new link on a few simple cases, and validated that its not a pdf, we check the base domain
 			// https://reports.companytoscrape.com == https://companytoscrape.com
 			// https://someothercompany.com != https://companytoscrape.com
-			same, err := lib.IsSameBaseDomain(newUrl.String(), fc.startUrl.String())
+			same, err := lib.IsSameBaseDomain(newUrl.String(), fc.collector.startUrl.String())
 			if err != nil || !same {
 				fc.siteMap.Visited(newUrl.String())
 				return
 			}
 
+			fc.log.Debug("adding url", slog.String("newUrl", newUrl.String()))
 			// if the next link is good, on the same base domain, and is not a pdf, we add it to the queue for colly to process next
-			if err := fc.addRequest(currentUrl, newUrl); err != nil {
+			if err := fc.collector.addRequest(currentUrl, newUrl); err != nil {
 				// this should not happen to often, as we prune the new links well
 				if !errors.Is(err, colly.ErrQueueFull) {
 					fc.log.Error("error adding request", slog.Any("error", err))
@@ -329,35 +358,8 @@ func (fc *finsterCollector) handleCallbacks() {
 		}
 	})
 
-	fc.c.OnResponse(func(r *colly.Response) {
-		// if we get a response straight away, reduce the backoff multiplier, this speeds new requests up
-		retries := r.Ctx.GetAny("retriesLeft")
-		if retries != nil {
-			retriesLeft, ok := r.Ctx.GetAny("retriesLeft").(float64)
-			if !ok {
-				fc.log.Error("retries not float var")
-			} else {
-				if fc.backoffMultiplier > 2 && retriesLeft == fc.maxRetries {
-					fc.backoffMultiplier--
-					fc.log.Debug("reducing backoff multiplier", slog.Int("backoff", fc.backoffMultiplier))
-				}
-			}
-		}
-
-		if r.Headers.Get("Content-Type") == "application/pdf" {
-			// fc.log.Info("pdf found", slog.String("parentUrl", r.Ctx.Get("parent")), slog.String("pdfUrl", r.Request.URL.String()))
-			fc.siteMap.AppendPdf(lib.Url{
-				ParentUrl:      r.Ctx.Get("parent"),
-				PdfUrl:         r.Request.URL.String(),
-				LastModified:   r.Headers.Get("Last-Modified"),
-				Etag:           r.Headers.Get("ETag"),
-				ExtractionTime: time.Now(),
-			})
-		}
-	})
-
-	fc.c.OnError(func(r *colly.Response, err error) {
-		firstRun := r.Request.URL.String() == fc.startUrl.String()
+	// on response check
+	fc.collector.OnError(func(r *colly.Response, err error) {
 		if r.Headers != nil {
 			// sometimes we get a pdf, that automatically downloads, this causes some errors, by checking and exiting out if a pdf is found we reduce this
 			if r.Headers.Get("Content-Type") == "application/pdf" {
@@ -377,40 +379,17 @@ func (fc *finsterCollector) handleCallbacks() {
 			}
 		}
 
-		if r.StatusCode != http.StatusNotFound && r.StatusCode != http.StatusBadRequest {
-			retriesLeft, ok := r.Ctx.GetAny("retriesLeft").(float64)
-			if !ok {
-				fc.log.Error("retries not float var")
-				return
-			}
-
-			if retriesLeft > 0 {
-				delay := time.Duration(math.Pow(float64(fc.backoffMultiplier), float64(fc.maxRetries-retriesLeft))) * time.Second
-				fc.log.Debug("Retrying request", slog.String("retry", r.Request.URL.String()), slog.Duration("delay", delay), slog.Float64("retriesLeft", retriesLeft), slog.Any("error", err))
-				time.Sleep(delay)
-				if firstRun && retriesLeft == 1 {
-					time.Sleep(time.Minute * 2)
-				}
-				r.Ctx.Put("retriesLeft", retriesLeft-1)
-				r.Request.Retry()
-			} else {
-				if fc.backoffMultiplier < 5 {
-					fc.backoffMultiplier++
-					fc.log.Debug("increasing backoff multiplier", slog.Int("backoff", fc.backoffMultiplier))
-				}
-				fc.log.Error("Error after retries", slog.Int("statusCode", r.StatusCode), slog.Any("headers", r.Headers), slog.String("reqUrl", r.Request.URL.String()), slog.Float64("retriesLeft", retriesLeft), slog.Any("error", err))
-			}
-		}
+		fc.collector.handleRetry(r, err)
 	})
 }
 
-func (fc *finsterCollector) run(wg *sync.WaitGroup, semaphore chan struct{}) {
+func (fc *siteScraper) run(wg *sync.WaitGroup, semaphore chan struct{}) {
 	defer wg.Done() // Notify the WaitGroup when the function is done
 	// Use the semaphore to limit the number of concurrent goroutines
 	semaphore <- struct{}{}        // Acquire a slot in the semaphore (this will block if the channel is full)
 	defer func() { <-semaphore }() // Release the slot in the semaphore when done
 
-	if err := fc.addRequest(fc.startUrl, fc.startUrl); err != nil {
+	if err := fc.collector.addRequest(fc.collector.startUrl, fc.collector.startUrl); err != nil {
 		fc.log.Error("error adding request", slog.Any("error", err))
 		return
 	}
@@ -421,7 +400,7 @@ func (fc *finsterCollector) run(wg *sync.WaitGroup, semaphore chan struct{}) {
 	fc.log.Info("scraping started")
 
 	go func() {
-		if err := fc.q.Run(fc.c); err != nil {
+		if err := fc.collector.Queue.Run(fc.collector.Collector); err != nil {
 			fc.log.Error("error starting queue")
 		}
 
@@ -457,17 +436,62 @@ func (fc *finsterCollector) run(wg *sync.WaitGroup, semaphore chan struct{}) {
 	fc.safeCounter.Increment()
 }
 
-func (fc *finsterCollector) addRequest(currentUrl, newLink *url.URL) error {
+func (q *queueCollector) addRequest(currentUrl, newLink *url.URL) error {
 	ctx := colly.NewContext()
 	ctx.Put("parent", currentUrl.String())
-	ctx.Put("retriesLeft", fc.maxRetries)
+	ctx.Put("retriesLeft", q.maxRetries)
 	h := &http.Header{}
 
 	h.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
 
-	return fc.q.AddRequest(&colly.Request{
+	return q.Queue.AddRequest(&colly.Request{
 		URL:     newLink,
 		Ctx:     ctx,
 		Headers: h,
 	})
+}
+
+func (q *queueCollector) handleRetry(r *colly.Response, err error) error {
+	if err != nil {
+		firstRun := r.Request.URL.String() == q.startUrl.String()
+		if r.StatusCode != http.StatusNotFound && r.StatusCode != http.StatusBadRequest {
+			retriesLeft, ok := r.Ctx.GetAny("retriesLeft").(float64)
+			if !ok {
+				return fmt.Errorf("retries not float var")
+			}
+
+			if retriesLeft > 0 {
+				delay := time.Duration(math.Pow(float64(q.backoffMultiplier), float64(q.maxRetries-retriesLeft))) * time.Second
+				// fc.log.Debug("Retrying request", slog.String("retry", r.Request.URL.String()), slog.Duration("delay", delay), slog.Float64("retriesLeft", retriesLeft), slog.Any("error", err))
+				time.Sleep(delay)
+				if firstRun && retriesLeft == 1 {
+					time.Sleep(time.Minute * 2)
+				}
+				r.Ctx.Put("retriesLeft", retriesLeft-1)
+				r.Request.Retry()
+			} else {
+				if q.backoffMultiplier < 5 {
+					q.backoffMultiplier++
+					// fc.log.Debug("increasing backoff multiplier", slog.Int("backoff", fc.backoffMultiplier))
+				}
+				return fmt.Errorf("error after retries")
+			}
+		}
+	} else {
+		// if we get a response straight away, reduce the backoff multiplier, this speeds new requests up
+		retries := r.Ctx.GetAny("retriesLeft")
+		if retries != nil {
+			retriesLeft, ok := r.Ctx.GetAny("retriesLeft").(float64)
+			if !ok {
+				return fmt.Errorf("retries not float var")
+			} else {
+				if q.backoffMultiplier > 2 && retriesLeft == q.maxRetries {
+					q.backoffMultiplier--
+					// q.log.Debug("reducing backoff multiplier", slog.Int("backoff", fc.backoffMultiplier))
+				}
+			}
+		}
+	}
+
+	return nil
 }

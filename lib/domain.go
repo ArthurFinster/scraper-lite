@@ -1,13 +1,15 @@
 package lib
 
 import (
+	"errors"
+	"log"
 	"net/url"
 	"strings"
 
 	"golang.org/x/net/publicsuffix"
 )
 
-func IsValidRelTag(rel string) bool {
+func IsValidRelAttr(rel string) bool {
 	if strings.Contains(rel, "stylesheet") || strings.Contains(rel, "icon") || strings.Contains(rel, "dns-prefetch") || strings.Contains(rel, "preconnect") || strings.Contains(rel, "preload") {
 		return false
 	}
@@ -77,4 +79,19 @@ func IsSocialDomain(u1 string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func GetBaseUrl(parsedUrl *url.URL) (string, error) {
+	host, err := publicsuffix.EffectiveTLDPlusOne(parsedUrl.Hostname())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Split by "." and get the first part (e.g., "novonordisk")
+	parts := strings.Split(host, ".")
+	if len(parts) > 0 {
+		return parts[0], nil
+	} else {
+		return "", errors.New("could not extract name from host")
+	}
 }
